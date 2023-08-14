@@ -3,7 +3,8 @@ import numpy as np
 import gym
 import mujoco_py
 from gym.envs.registration import register
-
+from enum import Enum 
+from robohive.utils.quat_math import mat2quat
 
 def change_fetch_model(change_model):
     import os
@@ -24,7 +25,31 @@ def change_fetch_model(change_model):
 
 def make(domain_name, task_name, seed, from_pixels, height, width, cameras=range(1),
          visualize_reward=False, frame_skip=None, reward_type='dense', change_model=False):
-    if 'RealArm' not in domain_name:
+    if 'franka' in domain_name:
+        env_id = domain_name.split("-", 1)[-1] + "-v0"
+        reward_mode = 'sparse'      
+
+        cameras = []
+        if 'BinPick' in env_id:
+            cameras = ['left_cam', 'right_cam']
+            franka_task = FrankaTask.BinPick
+        elif 'BinPush' in env_id:
+            cameras = ['top_cam']
+            franka_task = FrankaTask.BinPush
+        elif 'BinReorient' in env_id:
+            cameras = ['left_cam', 'right_cam']
+            franka_task = FrankaTask.BinReorient
+        elif 'PlanarPush' in env_id:
+            cameras = ['right_cam']
+            franka_task = FrankaTask.PlanarPush
+        else:
+            assert(False)
+
+        env = gym.make(env_id, **{'reward_mode': reward_mode, 'is_hardware': False, 'torque_scale': 1.0})
+        env = EnvWrapper(env, from_pixels=from_pixels, cameras=cameras, height=height, width=width, is_franka=True, franka_task=franka_task)
+        print('Created franka env')
+
+    elif 'RealArm' not in domain_name:
         change_fetch_model(change_model)
         env = gym.make(domain_name, reward_type=reward_type)
         env = GymEnvWrapper(env, from_pixels=from_pixels, cameras=cameras, height=height, width=width)
@@ -38,8 +63,15 @@ def make(domain_name, task_name, seed, from_pixels, height, width, cameras=range
     return env
 
 
+class FrankaTask(Enum):
+    BinPick=1
+    BinPush=2
+    HangPush=3
+    PlanarPush=4
+    BinReorient=5
+
 class EnvWrapper(gym.Env, ABC):
-    def __init__(self, env, cameras, from_pixels=True, height=100, width=100, channels_first=True):
+    def __init__(self, env, cameras, from_pixels=True, height=100, width=100, channels_first=True, is_franka=False, franka_task=None):
         camera_0 = {'trackbodyid': -1, 'distance': 1.5, 'lookat': np.array((0.0, 0.6, 0)),
                     'elevation': -45.0, 'azimuth': 90}
         camera_1 = {'trackbodyid': -1, 'distance': 1.5, 'lookat': np.array((0.0, 0.6, 0)),
@@ -69,6 +101,31 @@ class EnvWrapper(gym.Env, ABC):
         self.special_reset_save = None
         self.hybrid_obs = False
         self.viewer = None
+        self.is_franka = is_franka
+        self.franka_task = franka_task
+
+        if self.is_franka:
+            if self.franka_task == FrankaTask.BinPick:
+                act_low = -np.ones(6)
+                act_high = np.ones(6)    
+                ep_length = 100    
+            elif self.franka_task == FrankaTask.PlanarPush:
+                act_low = -np.ones(5)
+                act_high = np.ones(5)
+                ep_length = 50
+            elif self.franka_task == FrankaTask.BinReorient:
+                act_low = -np.ones(15)
+                act_high = np.ones(15)
+                ep_length = 150
+            elif self.franka_task == FrankaTask.BinPush:
+                act_low = -np.ones(3)
+                act_high = np.ones(3)
+                ep_length = 50
+            else:
+                assert False
+            self.franka_t = 0
+            self.act_space = gym.spaces.Box(act_low, act_high, dtype=np.float32)
+            self.ep_length = ep_length
 
         self.metadata = {
             'render.modes': ['human', 'rgb_array'],
@@ -96,7 +153,10 @@ class EnvWrapper(gym.Env, ABC):
 
     @property
     def action_space(self):
-        return self._env.action_space
+        if self.is_franka:
+            return self.act_space
+        else:
+            return self._env.action_space
 
     def seed(self, seed=None):
         return self._env.seed(seed)
@@ -115,20 +175,74 @@ class EnvWrapper(gym.Env, ABC):
         self.hybrid_obs = mode
 
     def _get_obs(self):
+        #assert(not self.is_franka or (self.from_pixels and not self.hybrid_obs))
         if self.from_pixels:
-            imgs = []
-            for c in self.cameras:
-                imgs.append(self.render(mode='rgb_array', camera_id=c))
-            if self.channels_first:
-                pixel_obs = np.concatenate(imgs, axis=0)
+            if self.is_franka:
+                img_views = []
+                vis_obs_dict = self._env.visual_dict
+                for i,camera_name in enumerate(self.cameras):
+                    rgb_key = 'rgb:'+camera_name+':100x100:2d'  
+                    if self.channels_first:
+                        rgb_img = vis_obs_dict[rgb_key].squeeze().transpose(2,0,1) # cxhxw     
+                    else:
+                        rgb_img = vis_obs_dict[rgb_key].squeeze()
+                    img_views.append(rgb_img)
+                if self.channels_first:
+                    pixel_obs = np.concatenate(img_views, axis=0)
+                else:         
+                    pixel_obs = np.concatenate(img_views, axis=2)
+
+                if self.hybrid_obs:
+                    return [pixel_obs, self._get_hybrid_state()]
+                else:
+                    return pixel_obs                    
             else:
-                pixel_obs = np.concatenate(imgs, axis=2)
-            if self.hybrid_obs:
-                return [pixel_obs, self._get_hybrid_state()]
-            else:
-                return pixel_obs
+                imgs = []
+                for c in self.cameras:
+                    imgs.append(self.render(mode='rgb_array', camera_id=c))
+                if self.channels_first:
+                    pixel_obs = np.concatenate(imgs, axis=0)
+                else:
+                    pixel_obs = np.concatenate(imgs, axis=2)
+                if self.hybrid_obs:
+                    return [pixel_obs, self._get_hybrid_state()]
+                else:
+                    return pixel_obs
         else:
             return self._get_state_obs()
+
+    def _franka_state_obs(self, obs):
+
+        qp = self._env.sim.data.qpos.ravel()
+        qv = self._env.sim.data.qvel.ravel()
+        grasp_pos = self._env.sim.data.site_xpos[self._env.grasp_sid].ravel()
+        grasp_rot = mat2quat(self._env.sim.data.site_xmat[self._env.grasp_sid].reshape(3,3).transpose())
+        
+        
+        if self.franka_task == FrankaTask.BinReorient:
+            obj_err = self._env.sim.data.site_xpos[self._env.object_sid]-self._env.sim.data.site_xpos[self._env.hand_sid]
+            tar_err = np.array([np.abs(self._env.sim.data.site_xmat[self._env.object_sid][-1] - 1.0)],dtype=np.float)
+        else:
+            obj_err = self._env.sim.data.site_xpos[self._env.object_sid]-self._env.sim.data.site_xpos[self._env.grasp_sid]
+            tar_err = self._env.sim.data.site_xpos[self._env.target_sid]-self._env.sim.data.site_xpos[self._env.object_sid]
+
+        if self.franka_task == FrankaTask.BinReorient:
+            manual = np.concatenate([qp[:17],
+                                        qv[:17],
+                                        grasp_pos,
+                                        grasp_rot])
+            assert(np.isclose(obs[:17], qp[:17]).all())
+            assert(np.isclose(obs[qp.shape[0]:qp.shape[0]+17], qv[:17]).all())
+            assert(np.isclose(obs[qp.shape[0]+qv.shape[0]:qp.shape[0]+qv.shape[0]+3], grasp_pos).all())
+            assert(np.isclose(obs[qp.shape[0]+qv.shape[0]+grasp_pos.shape[0]:qp.shape[0]+qv.shape[0]+grasp_pos.shape[0]+4],grasp_rot).all())                
+        else:
+            manual = np.concatenate([qp[:8], qv[:8], grasp_pos,grasp_rot])
+            assert(np.isclose(obs[:8], qp[:8]).all())
+            assert(np.isclose(obs[qp.shape[0]:qp.shape[0]+8], qv[:8]).all())
+            assert(np.isclose(obs[qp.shape[0]+qv.shape[0]:qp.shape[0]+qv.shape[0]+3], grasp_pos).all())
+            assert(np.isclose(obs[qp.shape[0]+qv.shape[0]+grasp_pos.shape[0]:qp.shape[0]+qv.shape[0]+grasp_pos.shape[0]+4],grasp_rot).all())
+
+        return manual
 
     def _get_state_obs(self):
         return self._state_obs
@@ -143,13 +257,57 @@ class EnvWrapper(gym.Env, ABC):
         else:
             return None
 
+    def get_base_env_action(self, action):
+        assert(len(action.shape)==1)
+        if self.franka_task == FrankaTask.BinPick:
+            assert(action.shape[0] == 6)
+            aug_action = np.zeros(7, dtype=action.dtype)
+            aug_action[:3] = action[:3]
+            aug_action[3] = 1.0+0.1*np.random.normal()
+            aug_action[4] = -1.0+0.1*np.random.normal()
+            aug_action[5] = np.arctan2(action[4], action[3])
+            aug_action[5] = 2*(((aug_action[5] - self._env.pos_limits['eef_low'][5]) / (self._env.pos_limits['eef_high'][5] - self._env.pos_limits['eef_low'][5])) - 0.5)
+            aug_action[6] = 2*(int(action[5]>0.0)-0.5)
+        elif self.franka_task == FrankaTask.BinReorient:
+            assert(action.shape[0] == 15)
+            aug_action = np.zeros(16, dtype=action.dtype)
+            aug_action[:3] = action[:3]
+            aug_action[3] = 1.0+0.05*np.random.normal()
+            aug_action[4] = -1.0+0.05*np.random.normal()
+            aug_action[5] = np.arctan2(action[4], action[3])
+            aug_action[5] = 2*(((aug_action[5] - self._env.pos_limits['eef_low'][5]) / (self._env.pos_limits['eef_high'][5] - self._env.pos_limits['eef_low'][5])) - 0.5)
+            aug_action[6:] = action[5:]
+        else:
+            aug_action = np.zeros(7, dtype=action.dtype)
+            aug_action[:3] = action[:3]
+            # Note that unset dimensions of aug_action will be clipped to a constant value
+            # as specified in env/arms/franka/__init__.py
+            if self.franka_task == FrankaTask.PlanarPush:
+                assert(action.shape[0] == 5)
+                aug_action[5] = np.arctan2(action[4], action[3])
+                aug_action[5] = 2*(((aug_action[5] - self._env.pos_limits['eef_low'][5]) / (self._env.pos_limits['eef_high'][5] - self._env.pos_limits['eef_low'][5])) - 0.5)
+            else:
+                assert(action.shape[0] == 3)
+        return aug_action
+
     def step(self, action):
 
-        self._state_obs, reward, done, info = self._env.step(action)
+        if self.is_franka:
+            aug_action = self.get_base_env_action(action)
+            obs, reward, _, info = self._env.unwrapped.step(aug_action, update_exteroception=True)
+            self._state_obs = self._franka_state_obs(obs)
+            self.franka_t += 1
+            done = self.franka_t >= self.ep_length
+        else:
+            self._state_obs, reward, done, info = self._env.step(action)
         return self._get_obs(), reward, done, info
 
     def reset(self, save_special_steps=False):
         self._state_obs = self._env.reset()
+        if self.is_franka:
+            obs, rwd, done, env_info = self._env.forward(update_exteroception=True)
+            self._state_obs = self._franka_state_obs(self._state_obs)
+            self.franka_t = 0
         return self._get_obs()
 
     def set_state(self, qpos, qvel):
@@ -164,7 +322,10 @@ class EnvWrapper(gym.Env, ABC):
 
     @property
     def _max_episode_steps(self):
-        return self._env.max_path_length
+        if self.is_franka:
+            return self.ep_length
+        else:
+            return self._env.max_path_length
 
     def do_simulation(self, ctrl, n_frames):
         self._env.do_simulatiaon(ctrl, n_frames)
@@ -202,7 +363,8 @@ class EnvWrapper(gym.Env, ABC):
         if self.viewer is None:
             from mujoco_py import GlfwContext
             GlfwContext(offscreen=True)
-            self.viewer = mujoco_py.MjRenderContextOffscreen(self._env.sim, -1)
+            #self.viewer = mujoco_py.MjRenderContextOffscreen(self._env.sim, -1)
+            self.viewer = mujoco_py.MjRenderContextOffscreen(self._env.sim, 0)
         self.viewer_setup(camera_id)
         return self.viewer
 

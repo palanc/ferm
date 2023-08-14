@@ -1,3 +1,5 @@
+#!/bin/bash
+
 python train.py --domain_name FetchPickAndPlace-v1 \
   --reward_type sparse --cameras 8 10 --frame_stack 1 --num_updates 1 \
   --observation_type pixel --encoder_type pixel --work_dir ./data/FetchPickAndPlace-v1 \

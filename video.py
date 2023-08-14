@@ -19,12 +19,22 @@ class VideoRecorder(object):
     def record(self, env):
         if self.enabled:
             try:
-                frame = env.render(
-                    mode='rgb_array',
-                    height=self.height,
-                    width=self.width,
-                    camera_id=self.camera_id
-                )
+                if env.is_franka:
+                    if env.hybrid_obs:
+                        obs = env._get_obs()[0]
+                    else:
+                        obs = env._get_obs()
+                    if env.channels_first:
+                        frame = obs[:3].copy()
+                    else:
+                        frame = obs[:,:,:3].copy()
+                else:
+                    frame = env.render(
+                        mode='rgb_array',
+                        height=self.height,
+                        width=self.width,
+                        camera_id=self.camera_id
+                    )
             except TypeError:
                 frame = env.render(
                     mode='rgb_array',

@@ -18,7 +18,13 @@ from curl_sac import CurlSacAgent, RadSacAgent
 from torchvision import transforms
 
 import env_wrapper
-
+import robohive
+import glob
+from pathlib import Path
+from enum import Enum 
+from robohive.logger.grouped_datasets import Trace
+import cv2
+from env_wrapper import FrankaTask
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -62,7 +68,7 @@ def parse_args():
     parser.add_argument('--hidden_dim', default=1024, type=int)
     # eval
     parser.add_argument('--eval_freq', default=5000, type=int)
-    parser.add_argument('--num_eval_episodes', default=100, type=int)
+    parser.add_argument('--num_eval_episodes', default=30, type=int)
     # critic
     parser.add_argument('--critic_lr', default=1e-3, type=float)
     parser.add_argument('--critic_beta', default=0.9, type=float)
@@ -116,6 +122,21 @@ def evaluate(env, agent, video, num_episodes, L, step, args):
         start_time = time.time()
         prefix = 'stochastic_' if sample_stochastically else ''
         num_successes = 0
+
+        if env.is_franka:
+            joint_configs = []
+            joint_vels = []
+            joint_accels = []
+            joint_forces = []
+            joint_jerks = []
+            cart_pos = []
+            cart_vels = []
+            cart_accels = []
+            cart_jerks = []
+            velocimeter_id = env.unwrapped._env.sim.model.sensor_adr[env.unwrapped._env.sim.model.sensor_name2id('palm_velocimeter')]
+            accelerometer_id = env.unwrapped._env.sim.model.sensor_adr[env.unwrapped._env.sim.model.sensor_name2id('palm_accelerometer')]
+            contact_forces = []
+
         for i in range(num_episodes):
             obs = env.reset()
             video.init(enabled=(i == 0))
@@ -136,6 +157,29 @@ def evaluate(env, agent, video, num_episodes, L, step, args):
                     else:
                         action = agent.select_action(obs)
                 obs, reward, done, info = env.step(action)
+
+                if env.is_franka:
+                    joint_configs.append(env.unwrapped._env.sim.data.qpos.copy())
+                    joint_vels.append(env.unwrapped._env.sim.data.qvel.copy())
+                    joint_accels.append(env.unwrapped._env.sim.data.qacc.copy())
+                    joint_forces.append(env.unwrapped._env.sim.data.qfrc_actuator.copy())
+                    cart_pos.append(env.unwrapped._env.sim.data.site_xpos[env.unwrapped._env.grasp_sid].copy())
+                    cart_vels.append(env.unwrapped._env.sim.data.sensordata[velocimeter_id:velocimeter_id+3])
+                    cart_accels.append(env.unwrapped._env.sim.data.sensordata[accelerometer_id:accelerometer_id+3])
+
+                    if len(joint_accels) > 1:
+                        joint_jerks.append(joint_accels[-1]-joint_accels[-2])
+                        cart_jerks.append(cart_accels[-1]-cart_accels[-2])
+
+                    if env.franka_task == FrankaTask.BinReorient:
+                        contact_force = (env.unwrapped._env.sim.data.get_sensor('touch_sensor_tf')+
+                                        env.unwrapped._env.sim.data.get_sensor('touch_sensor_ff')+
+                                        env.unwrapped._env.sim.data.get_sensor('touch_sensor_pf'))
+                    else:
+                        contact_force = env.unwrapped._env.sim.data.get_sensor('touch_sensor_left')+env.unwrapped._env.sim.data.get_sensor('touch_sensor_right')
+                    if contact_force > 1e-5:
+                        contact_forces.append(contact_force)
+
                 if info.get('is_success'):
                     episode_success = True
                 video.record(env)
@@ -160,6 +204,70 @@ def evaluate(env, agent, video, num_episodes, L, step, args):
         L.log('eval/' + prefix + 'mean_episode_reward', mean_ep_reward, step)
         L.log('eval/' + prefix + 'best_episode_reward', best_ep_reward, step)
         L.log('eval/' + prefix + 'success_rate', success_rate, step)
+
+        if env.is_franka:
+            joint_configs = np.stack(joint_configs)
+            joint_configs_mean = np.linalg.norm(joint_configs, axis=1).mean()
+            joint_configs_max = np.abs(joint_configs).max()
+            L.log('eval/' + prefix + 'joint_configs_mean', joint_configs_mean, step)
+            L.log('eval/' + prefix + 'joint_configs_max', joint_configs_max, step)
+
+            joint_vels = np.stack(joint_vels)
+            joint_vels_mean = np.linalg.norm(joint_vels, axis=1).mean()
+            joint_vels_max = np.abs(joint_vels).max()
+            L.log('eval/' + prefix + 'joint_vels_mean', joint_vels_mean, step)
+            L.log('eval/' + prefix + 'joint_vels_max', joint_vels_max, step)
+
+            joint_accels = np.stack(joint_accels)
+            joint_accels_mean = np.linalg.norm(joint_accels, axis=1).mean()
+            joint_accels_max = np.abs(joint_accels).max()
+            L.log('eval/' + prefix + 'joint_accels_mean', joint_accels_mean, step)
+            L.log('eval/' + prefix + 'joint_accels_max', joint_accels_max, step)
+
+            joint_forces = np.stack(joint_forces)
+            joint_forces_mean = np.linalg.norm(joint_forces, axis=1).mean()
+            joint_forces_max = np.abs(joint_forces).max()
+            L.log('eval/' + prefix + 'joint_forces_mean', joint_forces_mean, step)
+            L.log('eval/' + prefix + 'joint_forces_max', joint_forces_max, step)
+
+            joint_jerks = np.stack(joint_jerks)
+            joint_jerks_mean = np.linalg.norm(joint_jerks, axis=1).mean()
+            joint_jerks_max = np.abs(joint_jerks).max()
+            L.log('eval/' + prefix + 'joint_jerks_mean', joint_jerks_mean, step)
+            L.log('eval/' + prefix + 'joint_jerks_max', joint_jerks_max, step)            
+
+            cart_pos = np.stack(cart_pos)
+            cart_pos_mean = np.linalg.norm(cart_pos, axis=1).mean()
+            cart_pos_max = np.abs(cart_pos).max()
+            L.log('eval/' + prefix + 'cart_pos_mean', cart_pos_mean, step)
+            L.log('eval/' + prefix + 'cart_pos_max', cart_pos_max, step)    
+
+            cart_vels = np.stack(cart_vels)
+            cart_vels_mean = np.linalg.norm(cart_vels, axis=1).mean()
+            cart_vels_max = np.abs(cart_vels).max()
+            L.log('eval/' + prefix + 'cart_vels_mean', cart_vels_mean, step)
+            L.log('eval/' + prefix + 'cart_vels_max', cart_vels_max, step) 
+
+            cart_accels = np.stack(cart_accels)
+            cart_accels_mean = np.linalg.norm(cart_accels, axis=1).mean()
+            cart_accels_max = np.abs(cart_accels).max()
+            L.log('eval/' + prefix + 'cart_accels_mean', cart_accels_mean, step)
+            L.log('eval/' + prefix + 'cart_accels_max', cart_accels_max, step) 
+
+            cart_jerks = np.stack(cart_jerks)
+            cart_jerks_mean = np.linalg.norm(cart_jerks, axis=1).mean()
+            cart_jerks_max = np.abs(cart_jerks).max()
+            L.log('eval/' + prefix + 'cart_jerks_mean', cart_jerks_mean, step)
+            L.log('eval/' + prefix + 'cart_jerks_max', cart_jerks_max, step) 
+
+            contact_forces = np.array(contact_forces)
+            contact_forces_mean = 0.0
+            contact_forces_max = 0.0
+            if contact_forces.shape[0] > 0:
+                contact_forces_mean = np.abs(contact_forces).mean()
+                contact_forces_max = np.abs(contact_forces).max()
+            L.log('eval/' + prefix + 'contact_forces_mean', contact_forces_mean, step)
+            L.log('eval/' + prefix + 'contact_forces_max', contact_forces_max, step)                 
 
         filename = args.work_dir + '/eval_scores.npy'
         key = args.domain_name + '-' + str(args.task_name) + '-' + args.data_augs
@@ -256,6 +364,183 @@ def make_agent(obs_shape, action_shape, args, device, hybrid_state_shape):
         assert 'agent is not supported: %s' % args.agent
 
 
+def trace2episodes(env, trace, exclude_fails=False, is_demo=False):
+
+    ep_observations = []
+    ep_actions = []
+    ep_states = []
+    ep_rewards = []
+
+    for pname, pdata in trace.trace.items():                  
+        successful_trial = True
+
+        if not is_demo or exclude_fails:
+            assert('success' in pdata)
+            assert(pdata['success'].all() or not pdata['success'].any())
+            successful_trial = pdata['success'].all()
+        
+        if exclude_fails and not successful_trial:
+            print('skipping trial')
+            continue
+
+        # Get images
+        views = []            
+        assert(env.channels_first)
+        for i, cam in enumerate(env.cameras):
+            rgb_key = 'env_infos/visual_dict/rgb:'+cam+':224x224:2d'
+                     
+            assert(rgb_key in pdata)
+              
+            rgb_imgs = pdata[rgb_key][:].transpose(0,3,1,2)
+            rgb_imgs = rgb_imgs[:env.ep_length+1,:,:,:]
+
+            scaled_rgb_images = np.zeros((rgb_imgs.shape[0],
+                                         rgb_imgs.shape[1],
+                                         100,100), dtype=rgb_imgs.dtype)
+            for j in range(rgb_imgs.shape[0]):
+                scaled_rgb_images[j,:,:,:] = cv2.resize(rgb_imgs[j].transpose(1,2,0), 
+                                                        dsize=(100, 100), 
+                                                        interpolation=cv2.INTER_CUBIC).transpose(2,0,1)
+            views.append(scaled_rgb_images)
+        obs = np.stack(views, axis=1)
+
+        franka_task = env.franka_task
+
+        qp = pdata['env_infos/obs_dict/qp'][:env.ep_length+1]
+        qv = pdata['env_infos/obs_dict/qv'][:env.ep_length+1]
+        grasp_pos = pdata['env_infos/obs_dict/grasp_pos'][:env.ep_length+1]
+        grasp_rot = pdata['env_infos/obs_dict/grasp_rot'][:env.ep_length+1]
+        obj_err = pdata['env_infos/obs_dict/object_err'][:env.ep_length+1]
+        tar_err = pdata['env_infos/obs_dict/target_err'][:env.ep_length+1]
+        assert((np.abs(qp[1:]-qp[0]) > 1e-5).any())
+        #assert((np.abs(qv[1:]-qv[0]) > 1e-5).any())
+        assert((np.abs(grasp_pos[1:]-grasp_pos[0]) > 1e-5).any())
+        assert((np.abs(grasp_rot[1:]-grasp_rot[0]) > 1e-5).any())
+
+
+        if franka_task == FrankaTask.BinReorient:
+            state = np.concatenate([qp[:,:17],
+                                    qv[:,:17],
+                                    grasp_pos,
+                                    grasp_rot], axis=1)
+        else:      
+            state = np.concatenate([qp[:,:8],
+                                    qv[:,:8],
+                                    grasp_pos,
+                                    grasp_rot], axis=1)
+
+        #state = torch.tensor(state, dtype=torch.float32)
+
+
+        actions = np.array(pdata['actions'])[:env.ep_length]
+        
+        if franka_task == FrankaTask.PlanarPush or franka_task == FrankaTask.BinPush:
+            actions = np.clip(actions,-1.0,1.0)
+
+        #assert((actions >= -1.01).all() and (actions <= 1.01).all())
+        if not((actions >= -1.0).all() and (actions <= 1.0).all()):
+            print('Found ep w/ oob actions, min {}, max {}'.format(actions.min(), actions.max()))
+        actions = np.clip(actions,-1.0,1.0)
+        assert (franka_task == FrankaTask.BinReorient and actions.shape[1] == 16) or actions.shape[1] == 7  
+
+        if franka_task == FrankaTask.BinPick:
+            aug_actions = np.zeros((actions.shape[0],6),dtype=np.float32)
+            aug_actions[:,:3] = actions[:,:3]
+            yaw = (0.5*actions[:,5]+0.5)*(env.unwrapped._env.pos_limits['eef_high'][5]-env.unwrapped._env.pos_limits['eef_low'][5])+env.unwrapped._env.pos_limits['eef_low'][5]
+            aug_actions[:,3] = np.cos(yaw)
+            aug_actions[:,4] = np.sin(yaw)
+            aug_actions[:,5] = actions[:,6]
+        elif franka_task == FrankaTask.BinPush or franka_task == FrankaTask.HangPush: 
+            aug_actions = np.zeros((actions.shape[0],3),dtype=np.float32)
+            aug_actions[:,:3] = actions[:,:3]
+        elif franka_task == FrankaTask.PlanarPush:
+            aug_actions = np.zeros((actions.shape[0],5),dtype=np.float32)
+            aug_actions[:,:3] = actions[:,:3]
+            yaw = (0.5*actions[:,5]+0.5)*(env.unwrapped._env.pos_limits['eef_high'][5]-env.unwrapped._env.pos_limits['eef_low'][5])+env.unwrapped._env.pos_limits['eef_low'][5]
+            aug_actions[:,3] = np.cos(yaw)
+            aug_actions[:,4] = np.sin(yaw)
+        elif franka_task == FrankaTask.BinReorient:
+            aug_actions = np.zeros((actions.shape[0],15),dtype=np.float32)
+            aug_actions[:,:3] = actions[:,:3]
+            yaw = (0.5*actions[:,5]+0.5)*(env.unwrapped._env.pos_limits['eef_high'][5]-env.unwrapped._env.pos_limits['eef_low'][5])+env.unwrapped._env.pos_limits['eef_low'][5]
+            aug_actions[:,3] = np.cos(yaw)
+            aug_actions[:,4] = np.sin(yaw)   
+            aug_actions[:,5:] = actions[:,6:]         
+        else:
+            raise NotImplementedError()
+
+        actions = aug_actions
+
+        rewards = np.array(pdata['env_infos/solved'][:env.ep_length], dtype=np.float32)#-1.
+            
+        ep_observations.append(obs)
+        ep_actions.append(actions)
+        ep_rewards.append(rewards)
+        ep_states.append(state)
+    
+    episodes = dict({
+        'ep_observations':ep_observations,
+        'ep_states':ep_states,
+        'ep_actions':ep_actions,
+        'ep_rewards':ep_rewards
+    })
+
+    return episodes
+
+
+def get_franka_demos(demo_dir, env):
+    assert(env.is_franka)
+    franka_task = env.franka_task
+    fps = glob.glob(str(Path(demo_dir) / "*.pickle"))
+
+    ep_observations = []
+    ep_actions = []
+    ep_states = []
+    ep_rewards = []
+
+    exclude_fails = False
+
+    for fp in fps:   
+        if len(ep_observations) >= 10:
+            break        
+        paths = Trace.load(fp)
+
+        paths_episodes = trace2episodes(env=env,
+                                        trace=paths,
+                                        exclude_fails=exclude_fails,
+                                        is_demo=True)
+        for i in range(len(paths_episodes['ep_observations'])):
+            if len(ep_observations) >= 10:
+                break
+           
+            assert(paths_episodes['ep_observations'][i].shape[0] == env.ep_length+1)
+            assert(paths_episodes['ep_observations'][i].shape[1] <= 2)
+            if paths_episodes['ep_observations'][i].shape[1] == 1:
+                obs = paths_episodes['ep_observations'][i][:,0]
+            elif paths_episodes['ep_observations'][i].shape[1] == 2:
+                obs = np.concatenate([paths_episodes['ep_observations'][i][:,0],
+                                      paths_episodes['ep_observations'][i][:,1]], axis=1)
+            else:
+                assert(False)
+
+            ep_observations.append(obs)
+            ep_states.append(paths_episodes['ep_states'][i])
+            ep_actions.append(paths_episodes['ep_actions'][i])
+            ep_rewards.append(paths_episodes['ep_rewards'][i])
+
+            print('Loaded demo {} of {}, reward {}'.format(len(ep_observations),10, np.sum(ep_rewards[-1])))
+    
+    assert(len(ep_observations)==10)
+
+    episodes = dict({
+        'ep_observations':ep_observations,
+        'ep_states':ep_states,
+        'ep_actions':ep_actions,
+        'ep_rewards':ep_rewards
+    })
+
+    return episodes
+
 def main():
     args = parse_args()
     if args.seed == -1:
@@ -276,15 +561,16 @@ def main():
         reward_type=args.reward_type,
         change_model=args.change_model
     )
-
+    #exit()
     env.seed(args.seed)
+    assert(not env.is_franka or (args.special_reset is None and args.demo_special_reset is None))
     if args.special_reset is not None:
         env.set_special_reset(args.special_reset)
     if args.demo_special_reset is not None:
         env.set_special_reset(args.demo_special_reset)
 
     if args.observation_type == 'hybrid':
-        env.set_hybrid_obs()
+        env.set_hybrid_obs(True)
 
     # stack several consecutive frames together
     if args.encoder_type == 'pixel':
@@ -344,8 +630,27 @@ def main():
         hybrid_state_shape=env.hybrid_state_shape,
         load_dir=args.replay_buffer_load_dir
     )
+    if env.is_franka:
+        demo_episodes = get_franka_demos(args.demo_model_dir, env)
+        demos = len(demo_episodes['ep_observations'])
+        assert(demos==10)
+        for i in range(demos):
+            for j in range(env.ep_length):
+                done_bool = 1.0 if j + 1 == env._max_episode_steps else 0.0
+                if env.hybrid_obs:
+                    replay_buffer.add(obs=[demo_episodes['ep_observations'][i][j], demo_episodes['ep_states'][i][j]], 
+                                    action=demo_episodes['ep_actions'][i][j], 
+                                    reward=demo_episodes['ep_rewards'][i][j], 
+                                    next_obs=[demo_episodes['ep_observations'][i][j+1], demo_episodes['ep_states'][i][j+1]], 
+                                    done=done_bool)                
+                else:
+                    replay_buffer.add(obs=demo_episodes['ep_observations'][i][j], 
+                                    action=demo_episodes['ep_actions'][i][j], 
+                                    reward=demo_episodes['ep_rewards'][i][j], 
+                                    next_obs=demo_episodes['ep_observations'][i][j+1], 
+                                    done=done_bool)
 
-    if args.demo_model_dir is not None:  # collect demonstrations using a state-trained expert
+    elif args.demo_model_dir is not None:  # collect demonstrations using a state-trained expert
         episode_step, done = 0, True
         state_obs, obs = None, None
         episode_success = False
@@ -408,7 +713,7 @@ def main():
                 replay_buffer.idx -= episode_step
 
         env.set_special_reset(args.special_reset)
-
+    
     print('Starting with replay buffer filled to {}.'.format(replay_buffer.idx))
 
     # args.init_steps = max(0, args.init_steps - args.replay_buffer_load_pi_t)  # maybe tune this
@@ -441,6 +746,8 @@ def main():
     if args.warmup_cpc:
         print("Warming up cpc for " + str(args.warmup_cpc) + ' steps.')
         for i in range(args.warmup_cpc):
+            if i % 100 == 0:
+                print('cpc step {}'.format(i))
             agent.update_cpc_only(replay_buffer, L, step=0, ema=args.warmup_cpc_ema)
         print('Warmed up cpc.')
 
